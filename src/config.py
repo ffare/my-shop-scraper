@@ -21,6 +21,7 @@ class SiteConfig:
     status: str = None
     sitemaps: list = field(default_factory=list)
     selectors: dict = field(default_factory=dict)
+    api: dict = field(default_factory=dict)
 
     @property
     def base_host(self) -> str:

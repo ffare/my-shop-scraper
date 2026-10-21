@@ -5,6 +5,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import yaml
@@ -12,8 +13,7 @@ from curl_cffi.requests import AsyncSession
 
 # Shared with the crawler so the checker and the crawl use the same logic.
 # Run as a module from the project root: python -m src.checker
-from types import SimpleNamespace
-
+from src.discover import discover_api, looks_like_shell
 from src.extract import PLATFORM_SELECTORS, extract, from_css
 
 # NOTE: no custom User-Agent anywhere. impersonate="chrome" sends a UA that
@@ -89,6 +89,8 @@ class Profile:
     sitemap_urls: int = 0
     sitemap_is_index: bool = False
     selectors: dict = field(default_factory=dict)
+    api: dict = field(default_factory=dict)
+    api_tried: bool = False
     extraction_ok: bool = True
     crawl_delay: float = None
     concurrency: int = 2
@@ -211,17 +213,33 @@ async def probe_impersonation(host):
         return None
 
 
-async def probe_product_page(url):
+async def probe_product_page(url, rendered=False):
     """Returns (jsonld_present, price_in_html, status_code, html)."""
     try:
-        r = await cffi_get(url)
+        if rendered:
+            from src.fetch_t2 import fetch as browser_fetch
+            r = await browser_fetch(url)
+            status = getattr(r, "status", None)
+        else:
+            r = await cffi_get(url)
+            status = getattr(r, "status_code", None)
     except Exception:
         return False, False, None, ""
     html = r.text
     return (bool(JSONLD_RE.search(html)),
             bool(PRICE_RE.search(html)),
-            r.status_code,
+            status,
             html)
+
+
+async def try_api(p, homepage_html, currency=None):
+    """Look for a JSON product API (once per site) and record the result."""
+    if p.api_tried:
+        return
+    p.api_tried = True
+    p.api, notes = await discover_api(p.host, homepage_html, currency)
+    p.notes.extend(notes)
+    p.api = p.api or {}
 
 
 def report_extraction(p, html, url):
@@ -277,16 +295,34 @@ def verify_selectors(p, html):
         p.notes.append(f"sample values: {sample}")
 
 
+def _looks_like_sitemap(text: str) -> bool:
+    head = text.lstrip()[:2000]
+    return "<urlset" in head or "<sitemapindex" in head
+
+
 async def probe_robots(host):
+    """Returns (crawl_delay, sitemaps)."""
+    delay, sitemaps = None, []
     try:
-        r = await cffi_get(f"https://{host}/robots.txt", timeout=15)
+        r = await cffi_get(f"https://{host}/robots.txt")
+        if r.status_code == 200:
+            sitemaps = re.findall(r"(?i)sitemap:\s*(\S+)", r.text)
+            m = re.search(r"(?i)crawl-delay:\s*([\d.]+)", r.text)
+            if m:
+                delay = float(m.group(1))
     except Exception:
-        return None, []
-    if r.status_code != 200:
-        return None, []
-    sitemaps = re.findall(r"(?i)sitemap:\s*(\S+)", r.text)
-    delay = re.search(r"(?i)crawl-delay:\s*([\d.]+)", r.text)
-    return (float(delay.group(1)) if delay else None), sitemaps
+        pass
+
+    if not sitemaps:
+        for path in ("/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"):
+            try:
+                r = await cffi_get(f"https://{host}{path}")
+            except Exception:
+                continue
+            if r.status_code == 200 and _looks_like_sitemap(r.text):
+                sitemaps.append(f"https://{host}{path}")
+                break
+    return delay, sitemaps
 
 
 async def probe_sitemap(url):
@@ -329,7 +365,7 @@ async def detect_platform(p, headers, cookies, body):
 
 # ----------------------------------------------------------------------- check
 
-async def check(domain, sample_product=None):
+async def check(domain, sample_product=None, currency=None):
     p = Profile(domain=domain)
     try:
         r, cookies, body, p.host = await probe_headers(domain)
@@ -383,19 +419,53 @@ async def check(domain, sample_product=None):
         if p.sitemap_is_index:
             p.notes.append(f"sitemap is an index with {p.sitemap_urls} children")
 
+    # JS-shell homepage: look for the site's JSON API before any browser work.
+    if looks_like_shell(r.text):
+        await try_api(p, r.text, currency)
+
     # JS dependency + JSON-LD
-    if sample_product:
+    if p.api:
+        p.notes.append("JSON API found - HTML/browser probes skipped")
+    elif sample_product:
         p.jsonld, rendered, st, html = await probe_product_page(sample_product)
         p.needs_js = not rendered and not p.jsonld
         p.notes.append(f"product probe: status={st} jsonld={p.jsonld} "
                        f"price_in_html={rendered}")
-        if html and st == 200:
+
+        # Price missing from the raw HTML: before paying for a browser, check
+        # for a JSON API (covers JS shells the marker check didn't catch).
+        if p.needs_js:
+            await try_api(p, r.text, currency)
+
+        # Tier-1 HTML looked empty -> re-probe through a browser so that
+        # extraction and selectors are judged on the rendered DOM.
+        # needs_js stays True: that IS the finding.
+        if p.needs_js and not p.api:
+            b_jsonld, b_rendered, b_st, b_html = await probe_product_page(
+                sample_product, rendered=True)
+            if b_html:
+                p.notes.append(
+                    f"browser re-probe: jsonld={b_jsonld} "
+                    f"price_in_html={b_rendered} bytes={len(b_html):,}")
+                html, st = b_html, b_st
+                p.jsonld = b_jsonld          # extraction hint only
+            else:
+                p.notes.append("browser re-probe returned no content")
+
+        if p.api:
+            p.notes.append("JSON API found - HTML selector checks skipped")
+        elif html and st == 200:
             verify_selectors(p, html)
             report_extraction(p, html, sample_product)
         else:
             p.notes.append("selector check skipped (no usable sample page)")
     else:
         p.notes.append("no sample product URL - JS and selector probes skipped")
+
+    # A working JSON API means plain tier-1 requests are enough.
+    if p.api:
+        p.needs_js = False
+        p.extraction_ok = True
 
     # --- Score ---
     if any(a in HARD_ANTIBOT for a in p.antibot):
@@ -425,7 +495,7 @@ def to_config(p):
     cfg = {"tier": p.tier,
            "concurrency": p.concurrency,
            "delay_s": p.crawl_delay or (2.0 if p.tier == 3 else 1.0),
-           "extract": "jsonld" if p.jsonld else "css",
+           "extract": ("api" if p.api else "jsonld" if p.jsonld else "css"),
            "verified": p.reachable and p.extraction_ok}
     if p.host and p.host != p.domain:
         cfg["host"] = p.host
@@ -441,19 +511,21 @@ def to_config(p):
         cfg["sitemaps"] = p.sitemaps
     if p.selectors:
         cfg["selectors"] = p.selectors
+    if p.api:
+        cfg["api"] = p.api
     return cfg
 
 
 # ------------------------------------------------------------------------ main
 
-async def main(sites, out, workers, verbose):
+async def main(sites, out, workers, verbose, currency=None):
     sem = asyncio.Semaphore(workers)
     results = [None] * len(sites)
 
     async def run(i, domain, sample):
         async with sem:
             try:
-                results[i] = await check(domain, sample)
+                results[i] = await check(domain, sample, currency)
             except Exception as e:
                 p = Profile(domain=domain)
                 p.reachable = False
@@ -478,7 +550,7 @@ async def main(sites, out, workers, verbose):
                 print(f"        x-headers: {', '.join(ev['xheaders'][:15])}")
 
     # Merge instead of overwrite: keep sites not in this run, and keep any
-    # hand-written selectors for sites that are re-checked.
+    # hand-written selectors / api block for sites that are re-checked.
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     existing = {}
     if Path(out).exists():
@@ -491,6 +563,11 @@ async def main(sites, out, workers, verbose):
         if old.get("selectors"):
             # hand-written (or previously saved) selectors win on conflict
             cfg["selectors"] = {**cfg.get("selectors", {}), **old["selectors"]}
+        if old.get("api"):
+            cfg["api"] = old["api"]             # hand-written api block wins
+        if cfg.get("api"):
+            # served through its JSON API: plain tier-1 requests are enough
+            cfg.update(tier=1, extract="api", verified=True)
         fresh[p.domain] = cfg
 
     with open(out, "w") as f:
@@ -508,10 +585,14 @@ if __name__ == "__main__":
                     help="sites checked in parallel (default: 4)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="print raw headers/cookies as detection evidence")
+    ap.add_argument("--currency", default=None,
+                    help="currency code for API sites whose domain and data "
+                         "give no hint (e.g. TND)")
     args = ap.parse_args()
 
     sites = load_sites(args.file)
     if not sites:
         sys.exit(f"no sites found in {args.file}")
     print(f"checking {len(sites)} sites, {args.workers} at a time\n")
-    asyncio.run(main(sites, args.out, args.workers, args.verbose))
+    asyncio.run(main(sites, args.out, args.workers, args.verbose,
+                     args.currency))

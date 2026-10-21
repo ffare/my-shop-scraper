@@ -35,11 +35,21 @@ www.wamia.tn:
     price: '[itemprop=price]@content'
     currency: '[itemprop=priceCurrency]@content'
 rarerichtn.com:
-  tier: 2
-  concurrency: 2
+  tier: 1
+  concurrency: 4
   delay_s: 1.0
-  extract: css
-  verified: false
+  extract: api
+  verified: true
+  api:
+    url: https://rarerichtn.com/api/products
+    items: ''
+    fields:
+      title: name
+      price: price
+      sku: id
+      description: description
+      image: images
+      availability: stock
 9achekk-store.converty.shop:
   tier: 1
   concurrency: 4
@@ -48,3 +58,11 @@ rarerichtn.com:
   verified: true
   sitemaps:
   - https://9achekk-store.converty.shop/sitemap.xml
+sou9finds.com:
+  tier: 1
+  concurrency: 4
+  delay_s: 1.0
+  extract: css
+  verified: false
+  sitemaps:
+  - https://sou9finds.com/sitemap.xml

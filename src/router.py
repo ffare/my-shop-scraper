@@ -66,19 +66,23 @@ class Router:
         url = self._rewrite_host(url, cfg)
 
         last = None
+        errors = []
         for tier in range(cfg.tier, 4):
-            async with self.limiter.slot(cfg):
+            for attempt in (1, 2):
                 try:
-                    if tier == 1:
-                        return await fetch_t1.fetch(url), cfg
-                    if tier == 2:
-                        from src import fetch_t2
-                        return await fetch_t2.fetch(url), cfg
-                    if tier == 3:
+                    async with self.limiter.slot(cfg):
+                        if tier == 1:
+                            return await fetch_t1.fetch(url), cfg
+                        if tier == 2:
+                            from src import fetch_t2
+                            return await fetch_t2.fetch(url), cfg
                         from src import fetch_t3
                         return await fetch_t3.fetch(url), cfg
                 except fetch_t1.Blocked as e:
-                    last = e
+                    errors.append(f"t{tier}: blocked: {e}")
+                    break                        # blocked: escalate, don't retry
                 except Exception as e:
-                    last = e
-        raise RuntimeError(f"all tiers failed for {url}: {last}")
+                    errors.append(f"t{tier}/try{attempt}: {type(e).__name__}: {e}")
+                    if attempt == 1:
+                        await asyncio.sleep(2)   # network blip: retry this tier once
+        raise RuntimeError(f"all tiers failed for {url}: {' | '.join(errors)}")

@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src import db, extract
+from src import api, db, extract
 from src.queue import Queue
 from src.router import Router
 
@@ -44,6 +44,8 @@ async def worker(router: Router, queue: Queue, con, stop: asyncio.Event,
                     and stats.get("active", 0) == 0):
                 stop.set()
                 break
+            await asyncio.sleep(0.05)      # yield; don't spin
+            continue
 
         state["busy"] += 1          # no await between claim and this line
         row = rows[0]
@@ -56,6 +58,18 @@ async def worker(router: Router, queue: Queue, con, stop: asyncio.Event,
                 (hashlib.sha256(row["url"].encode()).hexdigest(), row["url"],
                  resp.status, resp.tier, path,
                  datetime.now(timezone.utc).isoformat()))
+
+            if row["kind"] == "api":
+                items = api.parse_items(resp.text, cfg.api)
+                counts = {}
+                for it in items:
+                    url, fields = api.item_to_product(it, cfg.api)
+                    r = db.save_product(con, cfg, url, fields)
+                    counts[r] = counts.get(r, 0) + 1
+                con.commit()
+                print(f"  [api] {len(items)} items {counts} from {row['url']}")
+                queue.done(row["id"], resp.tier)
+                continue
 
             if row["kind"] == "sitemap":
                 is_index, urls = parse_sitemap(resp.text)
@@ -92,11 +106,18 @@ async def run(workers: int, limit: int):
     queue = Queue()
     con = db.connect()
 
-    # Seed from sitemaps
+    # Seed: API endpoint, else sitemaps, else the homepage as a last resort.
     for domain, cfg in router.sites.items():
-        for sm in cfg.sitemaps[:2]:
-            print(f"seed {sm}")
-            queue.add(sm, domain, kind="sitemap")
+        if cfg.api:
+            print(f"seed api {cfg.api['url']}")
+            queue.add(cfg.api["url"], domain, kind="api")
+        if cfg.sitemaps:
+            for sm in cfg.sitemaps[:2]:
+                print(f"seed {sm}")
+                queue.add(sm, domain, kind="sitemap")
+        elif not cfg.api:
+            print(f"seed {cfg.base_host}/ (no sitemap)")
+            queue.add(f"https://{cfg.base_host}/", domain, kind="page")
 
     stop = asyncio.Event()
     state = {"busy": 0}

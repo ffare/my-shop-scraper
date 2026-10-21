@@ -1,0 +1,14 @@
+# --- checker dependencies ---
+# Python >= 3.10 required (curl_cffi dropped 3.9)
+
+# TLS/JA3 impersonation — tier-1 fetch probe
+curl_cffi>=0.15.1,<0.17
+
+# plain HTTP probes (headers, robots, sitemap, platform endpoints)
+httpx>=0.27,<1.0
+
+# sites.yaml output
+PyYAML>=6.0
+
+# parsing
+selectolax>=0.3

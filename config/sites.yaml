@@ -1,0 +1,50 @@
+www.mytek.tn:
+  tier: 1
+  concurrency: 4
+  delay_s: 1.0
+  extract: css
+  verified: true
+  platform: magento
+  sitemaps:
+  - https://www.mytek.tn/media/sitemap/sitemap.xml
+  selectors:
+    sku: '[itemprop=sku]'
+    price: '[itemprop=price]@content'
+    currency: '[itemprop=priceCurrency]@content'
+    availability: '[itemprop=availability]@href'
+www.tunisianet.com.tn:
+  tier: 1
+  concurrency: 4
+  delay_s: 1.0
+  extract: css
+  verified: true
+  platform: prestashop
+  sitemaps:
+  - https://www.tunisianet.com.tn/1_index_sitemap.xml
+www.wamia.tn:
+  tier: 1
+  concurrency: 4
+  delay_s: 1.0
+  extract: css
+  verified: true
+  platform: magento
+  sitemaps:
+  - https://www.wamia.tn/media/sitemap.xml
+  selectors:
+    sku: '[itemprop=sku]'
+    price: '[itemprop=price]@content'
+    currency: '[itemprop=priceCurrency]@content'
+rarerichtn.com:
+  tier: 2
+  concurrency: 2
+  delay_s: 1.0
+  extract: css
+  verified: false
+9achekk-store.converty.shop:
+  tier: 1
+  concurrency: 4
+  delay_s: 1.0
+  extract: jsonld
+  verified: true
+  sitemaps:
+  - https://9achekk-store.converty.shop/sitemap.xml

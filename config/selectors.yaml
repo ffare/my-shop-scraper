@@ -1,0 +1,7 @@
+# config/selectors.yaml
+platforms:
+  magento:
+    sku: "[itemprop=sku]"
+    price: "[itemprop=price]@content"
+    currency: "[itemprop=priceCurrency]@content"
+    availability: "[itemprop=availability]@href"

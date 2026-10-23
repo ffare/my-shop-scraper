@@ -68,6 +68,10 @@ async def worker(router: Router, queue: Queue, con, stop: asyncio.Event,
                     counts[r] = counts.get(r, 0) + 1
                 con.commit()
                 print(f"  [api] {len(items)} items {counts} from {row['url']}")
+                nxt = api.next_page(resp.text, row["url"], cfg.api)
+                if nxt:
+                    queue.add(nxt, row["domain"], kind="api")
+                    print("  [api] next page queued")
                 queue.done(row["id"], resp.tier)
                 continue
 
@@ -111,11 +115,11 @@ async def run(workers: int, limit: int):
         if cfg.api:
             print(f"seed api {cfg.api['url']}")
             queue.add(cfg.api["url"], domain, kind="api")
-        if cfg.sitemaps:
+        elif cfg.sitemaps:
             for sm in cfg.sitemaps[:2]:
                 print(f"seed {sm}")
                 queue.add(sm, domain, kind="sitemap")
-        elif not cfg.api:
+        else:
             print(f"seed {cfg.base_host}/ (no sitemap)")
             queue.add(f"https://{cfg.base_host}/", domain, kind="page")
 

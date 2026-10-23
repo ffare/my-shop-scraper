@@ -1,68 +1,17 @@
-www.mytek.tn:
-  tier: 1
-  concurrency: 4
-  delay_s: 1.0
-  extract: css
-  verified: true
-  platform: magento
-  sitemaps:
-  - https://www.mytek.tn/media/sitemap/sitemap.xml
-  selectors:
-    sku: '[itemprop=sku]'
-    price: '[itemprop=price]@content'
-    currency: '[itemprop=priceCurrency]@content'
-    availability: '[itemprop=availability]@href'
-www.tunisianet.com.tn:
-  tier: 1
-  concurrency: 4
-  delay_s: 1.0
-  extract: css
-  verified: true
-  platform: prestashop
-  sitemaps:
-  - https://www.tunisianet.com.tn/1_index_sitemap.xml
-www.wamia.tn:
-  tier: 1
-  concurrency: 4
-  delay_s: 1.0
-  extract: css
-  verified: true
-  platform: magento
-  sitemaps:
-  - https://www.wamia.tn/media/sitemap.xml
-  selectors:
-    sku: '[itemprop=sku]'
-    price: '[itemprop=price]@content'
-    currency: '[itemprop=priceCurrency]@content'
-rarerichtn.com:
+labelle.tn:
   tier: 1
   concurrency: 4
   delay_s: 1.0
   extract: api
   verified: true
   api:
-    url: https://rarerichtn.com/api/products
-    items: ''
+    url: https://inventory.labelle.tn/ws/public/index.php/api/shop/listing/best?page=1&limit=12
+    items: products
+    currency: TND
+    product_url: "https://labelle.tn/accueil/{slug}"
     fields:
       title: name
       price: price
       sku: id
-      description: description
-      image: images
-      availability: stock
-9achekk-store.converty.shop:
-  tier: 1
-  concurrency: 4
-  delay_s: 1.0
-  extract: jsonld
-  verified: true
-  sitemaps:
-  - https://9achekk-store.converty.shop/sitemap.xml
-sou9finds.com:
-  tier: 1
-  concurrency: 4
-  delay_s: 1.0
-  extract: css
-  verified: false
-  sitemaps:
-  - https://sou9finds.com/sitemap.xml
+      image: image
+      availability: inStock

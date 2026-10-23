@@ -48,6 +48,10 @@ class Router:
         for domain, cfg in self.sites.items():
             if host.endswith("." + domain):
                 return cfg
+        # the site's JSON API may live on another host (e.g. Firestore)
+        for domain, cfg in self.sites.items():
+            if cfg.api and urlparse(cfg.api["url"]).netloc.lower() == host:
+                return cfg
         return None
 
     def _rewrite_host(self, url: str, cfg: SiteConfig) -> str:

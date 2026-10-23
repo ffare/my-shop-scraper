@@ -13,7 +13,7 @@ from curl_cffi.requests import AsyncSession
 
 # Shared with the crawler so the checker and the crawl use the same logic.
 # Run as a module from the project root: python -m src.checker
-from src.discover import discover_api, looks_like_shell
+from src.discover import discover_api, discover_from_traffic, looks_like_shell
 from src.extract import PLATFORM_SELECTORS, extract, from_css
 
 # NOTE: no custom User-Agent anywhere. impersonate="chrome" sends a UA that
@@ -91,6 +91,7 @@ class Profile:
     selectors: dict = field(default_factory=dict)
     api: dict = field(default_factory=dict)
     api_tried: bool = False
+    traffic_tried: bool = False
     extraction_ok: bool = True
     crawl_delay: float = None
     concurrency: int = 2
@@ -240,6 +241,38 @@ async def try_api(p, homepage_html, currency=None):
     p.api, notes = await discover_api(p.host, homepage_html, currency)
     p.notes.extend(notes)
     p.api = p.api or {}
+
+
+async def try_traffic(p, urls, currency=None):
+    """Render pages in the browser and look for a product-list JSON response.
+
+    Finds APIs that the JS-scan can't: other hosts, URLs built at runtime,
+    code split into chunks that aren't in the page's script tags.
+    """
+    if p.traffic_tried:
+        return
+    p.traffic_tried = True
+    try:
+        from src.fetch_t2 import fetch as browser_fetch
+    except Exception as e:
+        p.notes.append(f"browser tier unavailable: {type(e).__name__}: {e}")
+        return
+
+    captured = []
+    for u in dict.fromkeys(x for x in urls if x):      # unique, in order
+        start = len(captured)
+        try:
+            await browser_fetch(u, capture=captured)
+        except Exception as e:
+            p.notes.append(f"browser capture failed for {u}: "
+                           f"{type(e).__name__}: {str(e)[:80]}")
+        for c in captured[start:]:
+            c["page"] = u
+
+    block, notes = await discover_from_traffic(captured, p.host, currency)
+    p.notes.extend(notes)
+    if block:
+        p.api = block
 
 
 def report_extraction(p, html, url):
@@ -422,6 +455,9 @@ async def check(domain, sample_product=None, currency=None):
     # JS-shell homepage: look for the site's JSON API before any browser work.
     if looks_like_shell(r.text):
         await try_api(p, r.text, currency)
+        if not p.api:
+            await try_traffic(p, [f"https://{p.host}/", sample_product],
+                              currency)
 
     # JS dependency + JSON-LD
     if p.api:
@@ -436,6 +472,9 @@ async def check(domain, sample_product=None, currency=None):
         # for a JSON API (covers JS shells the marker check didn't catch).
         if p.needs_js:
             await try_api(p, r.text, currency)
+        if p.needs_js and not p.api:
+            await try_traffic(p, [f"https://{p.host}/", sample_product],
+                              currency)
 
         # Tier-1 HTML looked empty -> re-probe through a browser so that
         # extraction and selectors are judged on the rendered DOM.
@@ -457,6 +496,13 @@ async def check(domain, sample_product=None, currency=None):
         elif html and st == 200:
             verify_selectors(p, html)
             report_extraction(p, html, sample_product)
+            if not p.extraction_ok:
+                if rendered:
+                    p.notes.append(
+                        "price-like text IS in the HTML but not in product "
+                        "markup (often cart/delivery UI text such as '7 DT')")
+                if not p.api_tried:
+                    await try_api(p, r.text, currency)
         else:
             p.notes.append("selector check skipped (no usable sample page)")
     else:

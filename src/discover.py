@@ -12,11 +12,11 @@ by host, so an API on another host would not resolve to a site config.
 import asyncio
 import json
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from curl_cffi.requests import AsyncSession
 
-from src.api import _get
+from src.api import _get, firestore_doc
 from src.db import parse_price
 
 COMMON_PATHS = [
@@ -26,7 +26,7 @@ COMMON_PATHS = [
 ]
 
 SHELL_MARKERS = ('id="root"', "id='root'", 'id="app"', 'id="__next"',
-                 'id="__nuxt"', "/_next/", "/assets/index-")
+                 'id="__nuxt"', "/_next/", "/assets/index-", "<app-root")
 
 SCRIPT_SRC = re.compile(r'<script[^>]+src=["\']([^"\']+)["\']', re.I)
 API_STR = re.compile(r'["\'`](/api/[A-Za-z0-9_\-/]+)')
@@ -42,7 +42,8 @@ ALIASES = {
     "price": ["price", "regular_price", "sale_price", "selling_price",
               "unit_price", "variants.0.price", "offers.price",
               "price.amount", "price.value"],
-    "sku": ["sku", "code", "reference", "ref", "variants.0.sku", "id", "slug"],
+    "sku": ["sku", "code", "reference", "ref", "variants.0.sku", "id", "slug",
+            "_docid"],
     "description": ["description", "desc", "short_description", "body_html",
                     "details"],
     "image": ["images", "image", "image_url", "thumbnail", "picture", "photo",
@@ -151,7 +152,8 @@ def _map_fields(sample: list):
 
 def _identity_ok(items: list, mapping: dict) -> bool:
     """Every product needs a unique key, or they overwrite each other."""
-    for path in (mapping.get("url"), "id", "slug", mapping.get("sku")):
+    for path in (mapping.get("url"), "id", "slug", "_docid",
+                 mapping.get("sku")):
         if not path:
             continue
         vals = [_get(it, path) for it in items]
@@ -176,7 +178,11 @@ async def _paging_notes(url, data, items) -> list:
         return json.dumps(it, sort_keys=True)[:200]
 
     first = {ident(it) for it in items}
-    _, items2 = _find_items(await _fetch_json(f"{url}?page=2"))
+    pu = urlparse(url)
+    q = [(k, v) for k, v in parse_qsl(pu.query, keep_blank_values=True)
+         if k != "page"] + [("page", "2")]
+    url2 = urlunparse(pu._replace(query=urlencode(q)))
+    _, items2 = _find_items(await _fetch_json(url2))
     if items2 and any(ident(it) not in first for it in items2):
         notes.append("API IS PAGINATED: ?page=2 returns different items - "
                      "the crawler reads only page 1")
@@ -186,9 +192,33 @@ async def _paging_notes(url, data, items) -> list:
     return notes
 
 
-async def _endpoints_from_js(host: str, html: str) -> list:
+FIREBASE_ID = re.compile(r'projectId["\']?\s*[:=]\s*["\']([a-z0-9\-]{4,})["\']',
+                         re.I)
+SUPABASE_HOST = re.compile(r'([a-z0-9]{15,})\.supabase\.co', re.I)
+
+
+def _scan_backends(text: str, hints: set):
+    """Name hosted backends the page's code talks to (reported, not read)."""
+    low = text.lower()
+    m = FIREBASE_ID.search(text)
+    if m and "firebase" in low:
+        hints.add(f"Firebase project {m.group(1)!r} (Firestore/Auth)")
+    elif "firebaseio.com" in low or "firestore.googleapis.com" in low:
+        hints.add("Firebase (Firestore/Realtime DB)")
+    m = SUPABASE_HOST.search(text)
+    if m:
+        hints.add(f"Supabase project {m.group(1)!r}")
+    if "/graphql" in low:
+        hints.add("a GraphQL endpoint (/graphql)")
+
+
+async def _endpoints_from_js(host: str, html: str):
+    """Returns (api paths seen in the site's JS, backend hints)."""
     base = f"https://{host}/"
     found = []
+    hints = set()
+    texts = [html or ""]
+    _scan_backends(html or "", hints)
     scripts = [urljoin(base, s) for s in SCRIPT_SRC.findall(html or "")]
     scripts = [u for u in scripts
                if urlparse(u).netloc.lower() == host.lower() and ".js" in u]
@@ -199,19 +229,173 @@ async def _endpoints_from_js(host: str, html: str) -> list:
             continue
         if r.status_code != 200:
             continue
+        _scan_backends(r.text[:3_000_000], hints)
+        texts.append(r.text[:3_000_000])
         for m in API_STR.finditer(r.text[:3_000_000]):
             path = m.group(1).rstrip("/")
             if (HINT.search(path) and not BAD.search(path)
                     and path not in found):
                 found.append(path)
         await asyncio.sleep(0.2)
-    return found[:10]
+    return found[:10], hints, texts
+
+
+async def discover_from_traffic(captured, host, default_currency=None):
+    """Pick a product-list endpoint out of JSON responses seen in the browser.
+
+    Returns (api_block or None, notes). Only GET responses are considered,
+    because the crawler fetches with GET. The endpoint may live on another
+    host; the router matches it through the site's `api.url`.
+    """
+    notes, best, seen, urls = [], None, set(), []
+    for c in captured:
+        if c.get("method") != "GET" or c.get("status") != 200:
+            continue
+        url = c["url"]
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        try:
+            data = json.loads(c["text"])
+        except ValueError:
+            continue
+        items_path, items = _find_items(data)
+        if not items:
+            continue
+        mapping = _map_fields(items[:25])
+        if not mapping or not _identity_ok(items, mapping):
+            continue
+        if best is None or len(items) > len(best["items"]):
+            best = {"c": c, "path": items_path, "items": items,
+                    "mapping": mapping, "data": data}
+
+    if not best:
+        notes.append(f"browser saw {len(urls)} JSON responses; none looked "
+                     "like a product list")
+        for u in urls[:8]:
+            notes.append(f"  seen: {u}")
+        return None, notes
+
+    url = best["c"]["url"]
+    block = {"url": url, "items": best["path"] or ""}
+    if "currency" not in best["mapping"]:
+        cur = (TLD_CURRENCY.get(host.rsplit(".", 1)[-1]) or default_currency)
+        if cur:
+            block["currency"] = cur
+        else:
+            notes.append("no currency field and the domain gives no hint - "
+                         "rerun with --currency XXX")
+    block["fields"] = best["mapping"]
+
+    notes.append(f"JSON API found in browser traffic: {url} "
+                 f"({len(best['items'])} items)")
+    if best["c"].get("page"):
+        notes.append(f"seen while loading {best['c']['page']} - it may be "
+                     "only a subset of the catalog (e.g. a 'new products' "
+                     "section)")
+    notes.append("api fields: " + ", ".join(
+        f"{k}<-{v}" for k, v in best["mapping"].items()))
+    if urlparse(url).netloc.lower() != host.lower():
+        notes.append(f"API is on another host ({urlparse(url).netloc})")
+    notes.extend(await _paging_notes(url, best["data"], best["items"]))
+    return block, notes
+
+
+API_KEY = re.compile(r'apiKey["\']?\s*[:=]\s*["\'](AIza[\w\-]{30,})["\']')
+COLL_CALL = re.compile(r'\bcollection\(\s*[^,()]+,\s*["\']([\w\-]+)["\']')
+COLL_COMPAT = re.compile(r'\.collection\(\s*["\']([\w\-]+)["\']')
+DOC_CALL = re.compile(r'\bdoc\(\s*[^,()]+,\s*["\']([\w\-]+)["\']\s*,')
+NON_PRODUCT = re.compile(r"user|order|review|coupon|offer|favo|wish|cart|admin|"
+                         r"config|setting|message|contact|counter|referr|notif",
+                         re.I)
+FIRESTORE_GUESSES = ["products", "items", "articles", "listings", "catalog"]
+
+
+async def _discover_firestore(host, texts, default_currency, notes):
+    """Read a Firebase project's product collection through the public
+    Firestore REST endpoint - the same read the site's own pages make.
+
+    A 401/403 means the site's rules require login; that is reported and
+    nothing is done to get around it.
+    """
+    blob = "\n".join(texts)
+    m = FIREBASE_ID.search(blob)
+    if not m:
+        return None
+    project = m.group(1)
+    km = API_KEY.search(blob)
+    key = km.group(1) if km else None
+
+    names = []
+    for rx in (COLL_CALL, COLL_COMPAT, DOC_CALL):
+        for n in rx.findall(blob):
+            if n not in names and not NON_PRODUCT.search(n):
+                names.append(n)
+    names = (names + [g for g in FIRESTORE_GUESSES if g not in names])[:8]
+
+    base = (f"https://firestore.googleapis.com/v1/projects/{project}"
+            "/databases/(default)/documents")
+    denied = False
+    for coll in names:
+        url = f"{base}/{coll}?pageSize=300" + (f"&key={key}" if key else "")
+        try:
+            r = await _fetch(url)
+        except Exception:
+            continue
+        await asyncio.sleep(0.3)
+        if r.status_code in (401, 403):
+            denied = True
+            continue
+        if r.status_code != 200:
+            continue
+        try:
+            data = json.loads(r.text)
+        except ValueError:
+            continue
+        docs = [firestore_doc(d) for d in data.get("documents", [])]
+        if not docs:
+            continue
+        mapping = _map_fields(docs[:25])
+        if not mapping or not _identity_ok(docs, mapping):
+            continue
+
+        block = {"url": url, "format": "firestore", "items": "documents",
+                 "product_url": f"{base}/{coll}/{{_docid}}"}
+        if "currency" not in mapping:
+            cur = (TLD_CURRENCY.get(host.rsplit(".", 1)[-1])
+                   or default_currency)
+            if cur:
+                block["currency"] = cur
+            else:
+                notes.append("no currency field and the domain gives no "
+                             "hint - rerun with --currency XXX")
+        block["fields"] = mapping
+
+        notes.append(f"Firestore collection {coll!r} is publicly readable: "
+                     f"{len(docs)} documents")
+        notes.append("api fields: " + ", ".join(
+            f"{k}<-{v}" for k, v in mapping.items()))
+        if data.get("nextPageToken"):
+            notes.append(f"the first page had {len(docs)} documents and "
+                         "Firestore reports more pages - the crawler "
+                         "follows them")
+        return block
+
+    if denied:
+        notes.append("Firestore reads were refused (401/403): the site "
+                     "requires login for its data. Not attempting to get "
+                     "around that.")
+    else:
+        notes.append(f"Firestore: no readable product collection among "
+                     f"{names}")
+    return None
 
 
 async def discover_api(host: str, html: str, default_currency: str | None = None):
     """Returns (api_block or None, notes)."""
     notes = []
-    from_js = await _endpoints_from_js(host, html)
+    from_js, hints, texts = await _endpoints_from_js(host, html)
     candidates = from_js + [p for p in COMMON_PATHS if p not in from_js]
 
     tried = 0
@@ -251,6 +435,13 @@ async def discover_api(host: str, html: str, default_currency: str | None = None
         return block, notes
 
     notes.append(f"no JSON API found ({tried} candidates tried)")
+    for h in sorted(hints):
+        notes.append(f"backend hint: the page's code uses {h} - product data "
+                     "is probably loaded from it by JavaScript")
+    if any(h.startswith("Firebase") for h in hints):
+        block = await _discover_firestore(host, texts, default_currency, notes)
+        if block:
+            return block, notes
     if from_js:
         notes.append("endpoints seen in the site's JS: " + ", ".join(from_js))
     return None, notes

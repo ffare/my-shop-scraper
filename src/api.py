@@ -5,7 +5,7 @@ has the same shape the HTML extractors produce, so db.save_product() handles
 it unchanged.
 """
 import json
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 DESC_KEYS = ("details", "en", "fr", "ar")
 
@@ -37,8 +37,89 @@ def _description(val):
     return val
 
 
+def _fs_value(v):
+    """Decode one Firestore REST typed value ({"stringValue": "x"}, ...)."""
+    if not isinstance(v, dict) or not v:
+        return v
+    for key in ("stringValue", "integerValue", "doubleValue", "booleanValue",
+                "timestampValue", "referenceValue"):
+        if key in v:
+            x = v[key]
+            return int(x) if key == "integerValue" else x
+    if "nullValue" in v:
+        return None
+    if "arrayValue" in v:
+        return [_fs_value(x) for x in v["arrayValue"].get("values", [])]
+    if "mapValue" in v:
+        return {k: _fs_value(x)
+                for k, x in v["mapValue"].get("fields", {}).items()}
+    return v
+
+
+def firestore_doc(doc: dict) -> dict:
+    """Firestore REST document -> plain dict, plus its id as `_docid`."""
+    out = {k: _fs_value(v) for k, v in (doc.get("fields") or {}).items()}
+    out["_docid"] = str(doc.get("name", "")).rsplit("/", 1)[-1]
+    return out
+
+
+def _with_param(url: str, key: str, value) -> str:
+    p = urlparse(url)
+    query = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+             if k != key]
+    query.append((key, str(value)))
+    return urlunparse(p._replace(query=urlencode(query)))
+
+
+def _int(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v)
+    return None
+
+
+def _first_int(data: dict, keys):
+    for k in keys:
+        n = _int(data.get(k))
+        if n is not None:
+            return n
+    return None
+
+
+def next_page(text: str, url: str, api: dict) -> str | None:
+    """URL of the next page of a paginated API, or None.
+
+    Firestore: follows nextPageToken. Page-numbered APIs: when the response
+    carries a current page and a total page count (page/pages,
+    current_page/last_page, ...), asks for page+1 until the last page. If a
+    server ignores the page parameter the URL repeats, and the queue's
+    uniqueness check ends the loop.
+    """
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if api.get("format") == "firestore":
+        token = data.get("nextPageToken")
+        return _with_param(url, "pageToken", token) if token else None
+
+    page = _first_int(data, ("page", "current_page", "currentPage"))
+    pages = _first_int(data, ("pages", "last_page", "lastPage",
+                              "total_pages", "totalPages"))
+    if page is not None and pages is not None and page < pages:
+        return _with_param(url, "page", page + 1)
+    return None
+
+
 def parse_items(text: str, api: dict) -> list:
     data = json.loads(text)
+    if api.get("format") == "firestore":
+        return [firestore_doc(d) for d in data.get("documents", [])]
     path = api.get("items", "")
     items = _get(data, path) if path else data
     if not isinstance(items, list):
